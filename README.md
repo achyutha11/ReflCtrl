@@ -2,7 +2,11 @@
 This is the official repository for [ReflCtrl: Controlling LLM Reflection via Representation Engineering](https://openreview.net/forum?id=ungnJ4O0AD). We will release the full codes soon. 
 For more information, please check out the [project website](https://lilywenglab.github.io/ReflCtrl/).
 ## Overview
-
+In this work, we study the self-reflection behavior of Large Reasoning Models (LRMs) from the perspective of representation engineering. We segment model’s reasoning into steps, identify the steps corresponding
+to reflection, and extract a reflection direction in the latent space that governs this
+behavior. Using this direction, we propose a stepwise steering method that can
+control reflection frequency. 
+![](overview.png)
 ## Cite this work
 ReflCtrl: Controlling LLM Reflection via Representation Engineering, Ge Yan, Chung-En Sun, Tsui-Wei Weng, NeurIPS MI workshop 2025.
 ```
