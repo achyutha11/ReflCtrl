@@ -30,7 +30,7 @@ python query_llm.py --dataset gsm8k --max_length 8192 --instruction " Please rea
 ## Cite this work
 ReflCtrl: Controlling LLM Reflection via Representation Engineering, Ge Yan, Chung-En Sun, Tsui-Wei Weng, NeurIPS MI workshop 2025.
 ```
-@inproceedings{
+@misc{
 yan2025reflctrl,
 title={ReflCtrl: Controlling {LLM} Reflection via Representation Engineering},
 author={Ge Yan and Chung-En Sun and Tsui-Wei Weng},
