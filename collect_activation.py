@@ -155,11 +155,15 @@ if __name__ == "__main__":
                        help="Run in debug mode with limited samples")
     parser.add_argument("--get_headwise_activations", action="store_true",
                        help="Get headwise activations")
+    parser.add_argument("--n_samples", type=int, default=None,
+                       help="Limit to first N questions (default: all)")
     args = parser.parse_args()
     MAX_RESPONSE_LENGTH = args.max_length
     questions = extract_questions(args.dataset)
     if args.debug:
         questions = questions[:10]
+    elif args.n_samples is not None:
+        questions = questions[:args.n_samples]
     activation_stores, is_reflect_stores, is_end_stores, output_list = collect_activations(questions, args.model, args.instruction, args.tensor_parallel_size, args.get_headwise_activations)
     output_dir = f"activations/{args.model}/{args.dataset}/{args.instruction}"
     if args.get_headwise_activations:

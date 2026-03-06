@@ -1,0 +1,113 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: achu-reflctrl-1
+  namespace: wenglab-interpretable-ai
+spec:
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+        workingDir: /am-oth-vol/ReflCtrl
+        tty: true
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            cd /am-oth-vol/ReflCtrl &&
+            pip install vllm==0.7.1 transformers datasets scikit-learn tqdm \
+                        accelerate sympy regex latex2sympy2 scipy numpy -q &&
+
+            MODEL=deepseek-r1-llama-8b
+            DATASET=gsm8k
+            N_QUESTIONS=200
+            MAX_LEN=8192
+            INTV_WEIGHT=-0.48
+            # Instruction appended to every question (DeepSeek-R1 expects boxed answers)
+            INSTRUCTION="Please reason step by step, and put your final answer within \\boxed{}."
+            # Instruction used for activation collection / direction extraction
+            # (empty string = use model default; keeps directory names simple)
+            TRAIN_INSTRUCTION=""
+
+            INTV_PATH=intervention_direction/${MODEL}/gsm8k-train/reflect_dir.pt
+            PROBE_DIR=probe_data/${MODEL}/${DATASET}/last_token_embedding
+            BASELINE_DIR=data/${DATASET}/baseline/${MODEL}
+
+            echo "=== Step 1: Collect activations (gsm8k train, first 500) ===" &&
+            python collect_activation.py \
+              --model ${MODEL} \
+              --dataset gsm8k-train \
+              --instruction "${TRAIN_INSTRUCTION}" \
+              --max_length ${MAX_LEN} \
+              --n_samples 500 &&
+
+            echo "=== Step 2: Extract direction vectors ===" &&
+            python extract_dir.py \
+              --model ${MODEL} \
+              --dataset gsm8k-train \
+              --instruction "${TRAIN_INSTRUCTION}" &&
+
+            echo "=== Step 3: Baseline evaluation (test) ===" &&
+            python run_eval.py \
+              --model ${MODEL} \
+              --dataset ${DATASET} \
+              --n_questions ${N_QUESTIONS} \
+              --max_length ${MAX_LEN} \
+              --output_dir ${BASELINE_DIR} &&
+
+            echo "=== Step 4: Train uncertainty probe ===" &&
+            python train_probe.py \
+              --model ${MODEL} \
+              --dataset ${DATASET} \
+              --results_path ${BASELINE_DIR}/results_samples1.json \
+              --probe_save_dir ${PROBE_DIR} &&
+
+            echo "=== Step 5: Fixed-lambda steering evaluation ===" &&
+            python run_eval.py \
+              --model ${MODEL} \
+              --dataset ${DATASET} \
+              --n_questions ${N_QUESTIONS} \
+              --max_length ${MAX_LEN} \
+              --with_intervention ${INTV_WEIGHT} \
+              --intervention_type additive \
+              --intv_path ${INTV_PATH} &&
+
+            echo "=== Step 6: Uncertainty-gated evaluation ===" &&
+            python run_eval.py \
+              --model ${MODEL} \
+              --dataset ${DATASET} \
+              --n_questions ${N_QUESTIONS} \
+              --max_length ${MAX_LEN} \
+              --with_intervention ${INTV_WEIGHT} \
+              --intervention_type probe_last_token \
+              --intv_path ${INTV_PATH} \
+              --probe_save_dir ${PROBE_DIR} &&
+
+            echo "=== Done ==="
+        env:
+        - name: HF_HOME
+          value: /am-oth-vol/.cache/huggingface
+        resources:
+          limits:
+            memory: 80Gi
+            cpu: "8"
+            nvidia.com/a100: "1"
+          requests:
+            memory: 80Gi
+            cpu: "8"
+            nvidia.com/a100: "1"
+        volumeMounts:
+        - name: am-oth-vol
+          mountPath: /am-oth-vol
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: am-oth-vol
+        persistentVolumeClaim:
+          claimName: am-oth-vol
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      restartPolicy: Never
+  backoffLimit: 0
