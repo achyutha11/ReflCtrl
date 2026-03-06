@@ -84,7 +84,10 @@ def collect_activations(questions: List[str], model: str, instruction: str, tens
     is_reflect_stores = []
     is_end_stores = []
     sampling_params.max_tokens = 1
+    print(f"Collecting activations for {len(outputs_full_ids)} questions...")
     for i, (prompt_token_ids, output_token_ids, text) in enumerate(outputs_full_ids):
+        if i % 50 == 0:
+            print(f"  [{i}/{len(outputs_full_ids)}] collecting activations...")
         # Generate responses for all questions at once
         activation_cacher.clear_cache()
         token_prompt = TokensPrompt(prompt_token_ids=list(prompt_token_ids) + list(output_token_ids))
@@ -96,7 +99,7 @@ def collect_activations(questions: List[str], model: str, instruction: str, tens
         # Identify the position of \n\n tokens
         think_step_positions = [-1] + [i for i, token_id in enumerate(output_token_ids) if token_id in THINK_DELIM_TOKEN_IDS]
         if len(think_step_positions) != len(think_steps):
-            warnings.warn(f"Number of think steps ({len(think_steps)}) does not match number of think step positions ({len(think_step_positions)}) for question {questions[i+j]}")
+            warnings.warn(f"Number of think steps ({len(think_steps)}) does not match number of think step positions ({len(think_step_positions)}) for question {i}")
             print(text)
             print(output_token_ids)
             continue

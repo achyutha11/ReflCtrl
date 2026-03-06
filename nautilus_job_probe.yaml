@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: achu-reflctrl-probe
+  namespace: wenglab-interpretable-ai
+spec:
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime
+        workingDir: /am-oth-vol/ReflCtrl
+        tty: true
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            cd /am-oth-vol/ReflCtrl &&
+            pip install vllm==0.7.1 transformers datasets scikit-learn tqdm \
+                        accelerate sympy regex latex2sympy2 scipy numpy -q &&
+
+            MODEL=deepseek-r1-llama-8b
+            DATASET=gsm8k
+            N_QUESTIONS=200
+            MAX_LEN=8192
+            INTV_WEIGHT=-0.39
+
+            INTV_PATH=intervention_direction/${MODEL}/gsm8k-train/reflect_dir.pt
+            PROBE_DIR=probe_data/${MODEL}/${DATASET}/reflect_dir
+
+            echo "=== Step 6: Uncertainty-gated evaluation ===" &&
+            python run_eval.py \
+              --model ${MODEL} \
+              --dataset ${DATASET} \
+              --n_questions ${N_QUESTIONS} \
+              --max_length ${MAX_LEN} \
+              --with_intervention ${INTV_WEIGHT} \
+              --intervention_type probe_last_token \
+              --intv_path ${INTV_PATH} \
+              --probe_save_dir ${PROBE_DIR} &&
+
+            echo "=== Done (Step 6) ==="
+        env:
+        - name: HF_HOME
+          value: /am-oth-vol/.cache/huggingface
+        resources:
+          limits:
+            memory: 80Gi
+            cpu: "8"
+            nvidia.com/a100: "1"
+          requests:
+            memory: 80Gi
+            cpu: "8"
+            nvidia.com/a100: "1"
+        volumeMounts:
+        - name: am-oth-vol
+          mountPath: /am-oth-vol
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: am-oth-vol
+        persistentVolumeClaim:
+          claimName: am-oth-vol
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      restartPolicy: Never
+  backoffLimit: 0

@@ -39,7 +39,7 @@ class InterventionDirection:
         weight_manager = None
         if type == "probe_last_token" or type == "probe_last_token_mid_reflect" or type.startswith("probe_last_token_temp_"):
             # Initialize weight manager
-            monitor = ProbeMonitoringManager(model, probe_save_dir, use_last_token_embedding=True,
+            monitor = ProbeMonitoringManager(model, probe_save_dir, use_last_token_embedding=False,
                                             intervention_dir=self)
             
             # Parse intervention type to determine scaler configuration

@@ -46,8 +46,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Standalone ReflCtrl evaluation (offline vLLM).")
     # include_samples adds --n_samples (samples per question for multi-sample eval)
     add_common_arguments(p, include_samples=True, include_intervention=True)
-    # Override the default for --instruction to the standard DeepSeek-R1 instruction
-    p.set_defaults(instruction=DEFAULT_INSTRUCTION)
+    # Override defaults: use correct DeepSeek-R1 instruction and step-boundary-only steering
+    p.set_defaults(
+        instruction=DEFAULT_INSTRUCTION,
+        step_begin_only=True,   # always steer only at \n\n boundaries, not every token
+    )
     p.add_argument("--n_questions", type=int, default=None,
                    help="Limit to first N questions (default: all).")
     p.add_argument("--probe_save_dir", type=str, default=None,
@@ -117,6 +120,20 @@ def run_eval(args: argparse.Namespace) -> None:
             if any(f"layers[{i}]" in c for i in active_layers)
         ]
 
+        # Step-boundary-only: collect token IDs that encode "\n\n".
+        # ConditionalInterventionHook wraps every layer hook so it only fires
+        # when the current input token is one of these delimiters — i.e. when
+        # the model is about to generate the first token of a new reasoning step.
+        # This avoids mid-sentence activation disruption.
+        condition_tokens = None
+        if args.step_begin_only:
+            tok = llm.get_tokenizer()
+            condition_tokens = [
+                tid for tid in range(tok.vocab_size)
+                if "\n\n" in tok.decode(tid)
+            ]
+            print(f"Step-boundary-only steering: {len(condition_tokens)} delimiter token(s)")
+
         def _apply_intervention(model):
             nonlocal weight_manager
             weight_manager = intv_dir.add_intervention(
@@ -125,12 +142,14 @@ def run_eval(args: argparse.Namespace) -> None:
                 type=args.intervention_type,
                 probe_save_dir=args.probe_save_dir,
                 components=active_components,
+                condition_tokens=condition_tokens,
             )
 
         llm.apply_model(_apply_intervention)
         print(
             f"Intervention: type={args.intervention_type}, "
             f"weight={args.with_intervention}, "
+            f"step_begin_only={args.step_begin_only}, "
             f"layers={args.intervention_layers or 'default (skip 6/6)'}"
         )
     else:
@@ -156,18 +175,15 @@ def run_eval(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Parse outputs into the format expected by analyze_math_results
     # ------------------------------------------------------------------
-    # analyze_math_results expects: List[List[Dict]] where each inner list
-    # corresponds to one question and contains one dict per sample.
-    responses_per_question: list[list[dict]] = []
+    # analyze_math_results expects: List[List[Dict]] where the outer list
+    # is indexed by sample and the inner list contains one dict per question.
+    print("Parsing outputs...")
+    responses_by_sample: list[list[dict]] = [[] for _ in range(args.n_samples)]
     for output in tqdm(outputs, desc="Parsing outputs"):
-        sample_responses = []
-        for completion in output.outputs:
+        for s, completion in enumerate(output.outputs):
             text = completion.text
 
             # Separate <think> content from final answer.
-            # DeepSeek-R1 generates <think> as its first token; strip it so
-            # reasoning contains only the thinking text (matching the format
-            # expected by collect_probe.py / train_probe.py).
             think_marker = "</think>"
             if think_marker in text:
                 think_part, answer_part = text.split(think_marker, 1)
@@ -182,17 +198,17 @@ def run_eval(args: argparse.Namespace) -> None:
             think_token_ids = tokenizer_vllm.encode(think_part, add_special_tokens=False)
             thinking_length = len(think_token_ids)
 
-            sample_responses.append({
+            responses_by_sample[s].append({
                 "content": answer_part.strip(),
                 "reasoning": think_part,
                 "thinking_length": thinking_length,
             })
-        responses_per_question.append(sample_responses)
 
     # ------------------------------------------------------------------
     # Score results
     # ------------------------------------------------------------------
-    aggregate_stats, analyzed_results = analyze_math_results(responses_per_question, args.dataset)
+    print("Scoring results...")
+    aggregate_stats, analyzed_results = analyze_math_results(responses_by_sample, args.dataset)
 
     print("\n=== Results ===")
     print(f"  accuracy:           {aggregate_stats['accuracy']:.4f}")
