@@ -15,7 +15,8 @@ spec:
         args:
           - |
             cd /am-oth-vol/ReflCtrl &&
-            pip install vllm==0.7.1 transformers datasets scikit-learn tqdm \
+            pip install vllm==0.7.1 -q &&
+            pip install datasets scikit-learn tqdm \
                         accelerate sympy regex latex2sympy2 scipy numpy -q &&
 
             MODEL=deepseek-r1-llama-8b
