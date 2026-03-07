@@ -428,9 +428,9 @@ class UncertaintyManager():
             self.scaler = UQWeightMidReflectScaler(max_intervention)
         else:
             raise ValueError(f"Unsupported scaler: {scaler}")
-        model.model.register_forward_pre_hook(self)
+        model.model.embed_tokens.register_forward_hook(self)
 
-    def __call__(self, module, input):
+    def __call__(self, module, input, output):
         # --- debug: print for first 5 calls ---
         self._dbg_n = getattr(self, '_dbg_n', 0) + 1
         if self._dbg_n <= 5:
