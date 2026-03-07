@@ -431,15 +431,7 @@ class UncertaintyManager():
         model.model.embed_tokens.register_forward_hook(self)
 
     def __call__(self, module, input, output):
-        # --- debug: print for first 5 calls ---
-        self._dbg_n = getattr(self, '_dbg_n', 0) + 1
-        if self._dbg_n <= 5:
-            cache_sizes = [len(v) for v in self.monitor.cacher.cache.values()]
-            print(f"[UQ #{self._dbg_n}] cache_sizes(first5)={cache_sizes[:5]} intv={self.intv_strength}", flush=True)
-        # --------------------------------------
         _, score = self.monitor.get_prediction()
-        if self._dbg_n <= 5:
-            print(f"[UQ #{self._dbg_n}] score={score}", flush=True)
         if score is None:
             return
         self.intv_strength = self.scaler(score)
