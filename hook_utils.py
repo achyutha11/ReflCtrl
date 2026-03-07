@@ -153,8 +153,11 @@ class ProbeHook():
         self.act_store = act_store
     
     def __call__(self, module, input, output):
-        projection = output @ self.direction.to(output.device)
-        self.act_store[self.name].append(projection.cpu())
+        if isinstance(output, tuple):
+            output = output[0]
+        last = output[..., -1, :]  # last token hidden state: [batch, hidden] or [hidden]
+        proj = (last @ self.direction.to(last.device)).squeeze()  # scalar
+        self.act_store[self.name].append(proj.float().cpu())
 
 
 class TokenEntropyWeightManager():
@@ -586,14 +589,21 @@ class ActivationProbe(ActivationCacher):
             eval(f"model.{component}.register_forward_hook(hook)")
 
     def compile_cache(self):
-        """Compile the cache into a single tensor and clear it"""
-        outputs = []
-        for component in self.cache:
-            if not self.cache[component]: return None
-            outputs.append(torch.cat(self.cache[component], dim=0)) # [num_tokens, batch_size]
-        outputs = torch.cat(outputs, dim=2).squeeze(0) # [batch_size, num_features]
+        """Compile the cache into a single feature vector and clear it.
+
+        Returns tensor of shape [1, n_components] matching train_probe.py feature order
+        (sorted component names), or None if any component cache is empty.
+        """
+        scalars = []
+        for component in sorted(self.cache):  # sorted order matches train_probe.py
+            if not self.cache[component]:
+                return None
+            proj = self.cache[component][-1].float()  # most recent token's projection
+            while proj.dim() > 0:
+                proj = proj[..., -1]  # reduce any remaining dims to scalar
+            scalars.append(proj)
         self.clear_cache()
-        return outputs
+        return torch.stack(scalars).unsqueeze(0)  # [1, n_components]
 
 
 class LastTokenEmbeddingCacher(ActivationCacher):
