@@ -37,13 +37,17 @@ class InterventionDirection:
                          probe_save_dir=None, step_token_ids=None, debug=False, confidence_threshold=6,
                          normalize_steer_vec=False):
         weight_manager = None
-        if type == "probe_last_token" or type == "probe_last_token_mid_reflect" or type.startswith("probe_last_token_temp_"):
+        if type == "probe_last_token" or type == "probe_last_token_mid_reflect" or type.startswith("probe_last_token_temp_") or type.startswith("hybrid"):
             # Initialize weight manager
             monitor = ProbeMonitoringManager(model, probe_save_dir, use_last_token_embedding=False,
                                             intervention_dir=self)
-            
+
             # Parse intervention type to determine scaler configuration
-            if type == "probe_last_token":
+            if type.startswith("hybrid"):
+                # Format: hybrid or hybrid_adj_<adj>_temp_<temp>_bias_<bias>
+                # Strip "hybrid" prefix to get scaler params
+                scaler = type  # pass the whole string, UncertaintyManager parses it
+            elif type == "probe_last_token":
                 scaler = "sigmoid"
             elif type == "probe_last_token_mid_reflect":
                 scaler = "mid_reflect"
@@ -62,7 +66,7 @@ class InterventionDirection:
                     scaler = "sigmoid"
             else:
                 scaler = "sigmoid"
-                
+
             weight_manager = UncertaintyManager(model, monitor, max_intervention=weight, scaler=scaler)
         elif type == "step_confidence" or type.startswith("step_confidence_"):
             # Parse k parameter if provided (format: step_confidence_k_<k_value>)
@@ -111,7 +115,7 @@ class InterventionDirection:
             elif type == "suppress":
                 target = self.components[component].mean_neg / self.components[component].mean_diff.norm()
                 hook = TargetedInterventionHook(base_direction, target, weight)
-            elif type == "probe_last_token" or type == "probe_last_token_mid_reflect" or type.startswith("probe_last_token_temp_"):
+            elif type == "probe_last_token" or type == "probe_last_token_mid_reflect" or type.startswith("probe_last_token_temp_") or type.startswith("hybrid"):
                 hook = FlexLinearInterventionHook(base_direction, weight_manager)
             elif type == "step_confidence" or type.startswith("step_confidence_"):
                 hook = FlexLinearInterventionHook(base_direction, weight_manager)
@@ -388,6 +392,26 @@ class UQWeightSigmoidScaler():
     def __call__(self, score):
         return self.max_intervention * (-(torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2)
 
+
+class HybridSigmoidScaler():
+    """Fixed base_lambda + small probe-driven adjustment.
+
+    intv_strength = base_lambda + adjustment_range * centered_sigmoid(score)
+    where centered_sigmoid maps score to [-1, +1].
+    """
+    def __init__(self, base_lambda=-0.39, adjustment_range=0.1, temp=2, bias=6):
+        self.base_lambda = base_lambda
+        self.adjustment_range = adjustment_range
+        self.temp = temp
+        self.bias = bias
+
+    def __call__(self, score):
+        # centered_sigmoid: maps score → [-1, +1]
+        # high score (confident) → +1 → base + adjustment (less suppression)
+        # low score (uncertain)  → -1 → base - adjustment (more suppression)
+        centered = (torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2
+        return self.base_lambda + self.adjustment_range * centered
+
 class UQWeightMidReflectScaler():
     def __init__(self, max_intervention=1):
         self.max_intervention = max_intervention
@@ -401,12 +425,12 @@ class UncertaintyManager():
         self.monitor = monitor
         self.max_intervention = max_intervention
         self.intv_strength = 0
-        
+
         # Parse scaler type to extract temp and bias for sigmoid scaler
         if scaler == "sigmoid" or scaler.startswith("sigmoid_"):
             temp = 20  # default
             bias = 6   # default
-            
+
             # Parse temp and bias from scaler string if provided
             if scaler.startswith("sigmoid_"):
                 # Format: sigmoid_temp_<temp>_bias_<bias>
@@ -422,8 +446,29 @@ class UncertaintyManager():
                     except (ValueError, IndexError):
                         # Use defaults if parsing fails
                         pass
-            
+
             self.scaler = UQWeightSigmoidScaler(max_intervention, temp, bias)
+        elif scaler.startswith("hybrid"):
+            # Format: hybrid or hybrid_adj_<adj>_temp_<temp>_bias_<bias>
+            adj = 0.1   # default adjustment range
+            temp = 2    # default (sharp threshold)
+            bias = 6    # default
+            base = max_intervention  # base_lambda comes from --with_intervention
+
+            if scaler.startswith("hybrid_"):
+                parts = scaler.split("_")
+                for key in ["adj", "temp", "bias"]:
+                    try:
+                        idx = parts.index(key)
+                        if idx + 1 < len(parts):
+                            val = float(parts[idx + 1])
+                            if key == "adj": adj = val
+                            elif key == "temp": temp = val
+                            elif key == "bias": bias = val
+                    except (ValueError, IndexError):
+                        pass
+
+            self.scaler = HybridSigmoidScaler(base_lambda=base, adjustment_range=adj, temp=temp, bias=bias)
         elif scaler == "mid_reflect":
             self.scaler = UQWeightMidReflectScaler(max_intervention)
         else:
