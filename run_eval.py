@@ -8,6 +8,7 @@ Modes (set via --intervention_type):
     (no --with_intervention)   baseline, no hooks
     additive                   fixed-lambda steering at every step boundary
     probe_last_token           uncertainty-gated: lambda scales with probe score
+    question_adaptive          per-question lambda based on prompt probe score
 
 Usage:
     # Baseline
@@ -23,6 +24,13 @@ Usage:
         --with_intervention -0.48 --intervention_type probe_last_token \\
         --intv_path intervention_direction/deepseek-r1-llama-8b/gsm8k/reflect_dir.pt \\
         --probe_save_dir probe_data/deepseek-r1-llama-8b/gsm8k/last_token_embedding
+
+    # Question-adaptive (prompt probe must be trained first via train_prompt_probe.py)
+    python run_eval.py --model deepseek-r1-llama-8b --dataset gsm8k \\
+        --with_intervention -0.39 --intervention_type question_adaptive \\
+        --intv_path intervention_direction/deepseek-r1-llama-8b/gsm8k-train/reflect_dir.pt \\
+        --probe_save_dir probe_data/deepseek-r1-llama-8b/gsm8k/prompt_probe \\
+        --lambda_confident -0.50 --lambda_uncertain -0.20
 """
 
 from __future__ import annotations
@@ -35,8 +43,11 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
+import numpy as np
+import torch
+
 from arg_utils import add_common_arguments
-from hook_utils import InterventionDirection, MODEL_NUM_LAYERS_MAP
+from hook_utils import InterventionDirection, MODEL_NUM_LAYERS_MAP, ProbeMonitor
 from utils import MODELS, analyze_math_results, extract_questions, get_save_dir
 
 DEFAULT_INSTRUCTION = "\nPlease reason step by step, and put your final answer within \\boxed{}."
@@ -57,6 +68,13 @@ def parse_args() -> argparse.Namespace:
                    help="Dir with clf_weights.pt / clf_bias.pt for probe_last_token mode.")
     p.add_argument("--output_dir", type=str, default=None,
                    help="Override output directory (default: derived from args).")
+    # Question-adaptive args
+    p.add_argument("--lambda_confident", type=float, default=-0.50,
+                   help="Lambda for confident questions (question_adaptive mode).")
+    p.add_argument("--lambda_uncertain", type=float, default=-0.20,
+                   help="Lambda for uncertain questions (question_adaptive mode).")
+    p.add_argument("--adaptive_threshold", type=float, default=0.0,
+                   help="Probe score threshold: >threshold=confident (question_adaptive mode).")
     return p.parse_args()
 
 
@@ -136,10 +154,12 @@ def run_eval(args: argparse.Namespace) -> None:
 
         def _apply_intervention(model):
             nonlocal weight_manager
+            # question_adaptive uses additive hooks; lambda is updated per-question
+            hook_type = "additive" if args.intervention_type == "question_adaptive" else args.intervention_type
             weight_manager = intv_dir.add_intervention(
                 model,
                 weight=args.with_intervention,
-                type=args.intervention_type,
+                type=hook_type,
                 probe_save_dir=args.probe_save_dir,
                 components=active_components,
                 condition_tokens=condition_tokens,
@@ -167,10 +187,119 @@ def run_eval(args: argparse.Namespace) -> None:
     )
 
     # ------------------------------------------------------------------
+    # Question-adaptive: set up prompt probe for per-question scoring
+    # ------------------------------------------------------------------
+    prompt_probe = None
+    prompt_probe_hooks = []
+    prompt_proj_buffer = {}
+    if args.intervention_type == "question_adaptive":
+        if args.probe_save_dir is None:
+            raise ValueError("--probe_save_dir required for question_adaptive mode.")
+        prompt_probe = ProbeMonitor(args.probe_save_dir)
+
+        # Register hooks to capture direction projections on the prompt
+        component_names = sorted(intv_dir.components.keys())
+        direction_vectors = {
+            comp: (
+                intv_dir.components[comp].mean_diff
+                / intv_dir.components[comp].mean_diff.norm()
+            ).float()
+            for comp in component_names
+        }
+
+        def make_proj_hook(comp_name, direction):
+            def hook(module, inp, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                if hidden.dim() == 3:
+                    last = hidden[:, -1, :].float()
+                else:
+                    last = hidden[-1, :].float().unsqueeze(0)
+                proj = (last @ direction.to(last.device)).squeeze()
+                prompt_proj_buffer[comp_name] = proj.item()
+            return hook
+
+        def register_proj_hooks(model):
+            for comp_name, direction in direction_vectors.items():
+                module = eval(f"model.{comp_name}")
+                handle = module.register_forward_hook(make_proj_hook(comp_name, direction))
+                prompt_probe_hooks.append(handle)
+
+        llm.apply_model(register_proj_hooks)
+        print(f"Question-adaptive: lambda_confident={args.lambda_confident}, "
+              f"lambda_uncertain={args.lambda_uncertain}, "
+              f"threshold={args.adaptive_threshold}")
+
+    # ------------------------------------------------------------------
     # Run inference
     # ------------------------------------------------------------------
-    print("Running inference...")
-    outputs = llm.generate(prompts, sampling_params)
+    if args.intervention_type == "question_adaptive":
+        # Per-question generation: score prompt, set lambda, generate
+        print("Running question-adaptive inference (one question at a time)...")
+        outputs = []
+        score_sp = SamplingParams(max_tokens=1, temperature=0.0)
+        lambda_choices = []
+
+        # Collect all intervention hooks so we can update their weights
+        intervention_hooks = []
+        def collect_hooks(model):
+            for comp in active_components:
+                module = eval(f"model.{comp}")
+                for h in module._forward_hooks.values():
+                    # Find the ConditionalInterventionHook wrapping a LinearInterventionHook
+                    from hook_utils import ConditionalInterventionHook, LinearInterventionHook
+                    if isinstance(h, ConditionalInterventionHook):
+                        if isinstance(h.hook, LinearInterventionHook):
+                            intervention_hooks.append(h.hook)
+                    elif isinstance(h, LinearInterventionHook):
+                        intervention_hooks.append(h)
+        llm.apply_model(collect_hooks)
+        print(f"  Found {len(intervention_hooks)} intervention hooks to update")
+
+        for i, prompt in enumerate(tqdm(prompts, desc="Question-adaptive eval")):
+            # 1) Score the prompt (disable steering during scoring pass)
+            for hook in intervention_hooks:
+                hook.weight = 0.0
+            prompt_proj_buffer.clear()
+            llm.generate(prompt, score_sp)
+
+            # Build feature vector and get probe score
+            component_names_sorted = sorted(prompt_proj_buffer.keys())
+            features = torch.tensor([[prompt_proj_buffer[c] for c in component_names_sorted]])
+            _, score = prompt_probe.predict(features)
+            score_val = score.item()
+
+            # 2) Map score to lambda
+            if score_val > args.adaptive_threshold:
+                chosen_lambda = args.lambda_confident
+            else:
+                chosen_lambda = args.lambda_uncertain
+            lambda_choices.append(chosen_lambda)
+
+            # 3) Update all hook weights
+            for hook in intervention_hooks:
+                hook.weight = chosen_lambda
+
+            # 4) Generate
+            out = llm.generate(prompt, sampling_params)
+            outputs.extend(out)
+
+            if (i + 1) % 50 == 0:
+                n_conf = sum(1 for l in lambda_choices if l == args.lambda_confident)
+                print(f"  [{i+1}/{len(prompts)}] confident: {n_conf}, "
+                      f"uncertain: {i+1-n_conf}")
+
+        # Remove projection hooks
+        for h in prompt_probe_hooks:
+            h.remove()
+
+        # Print adaptive stats
+        n_conf = sum(1 for l in lambda_choices if l == args.lambda_confident)
+        print(f"\nAdaptive stats: {n_conf}/{len(lambda_choices)} confident "
+              f"({100*n_conf/len(lambda_choices):.1f}%), "
+              f"{len(lambda_choices)-n_conf} uncertain")
+    else:
+        print("Running inference...")
+        outputs = llm.generate(prompts, sampling_params)
 
     # ------------------------------------------------------------------
     # Parse outputs into the format expected by analyze_math_results
