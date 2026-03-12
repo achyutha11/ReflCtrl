@@ -1,4 +1,5 @@
 import logging
+import os
 import torch
 from dataclasses import dataclass, field, asdict
 from typing import Dict
@@ -499,6 +500,89 @@ class ConditionalInterventionHook():
         else:
             result = torch.where(self.manager.is_active[..., None], intervened_output, output)
         return result
+
+
+class PerLayerProbeManager():
+    """Manages per-layer uncertainty probes for adaptive per-layer lambda.
+
+    At each \n\n boundary, captures hidden states from each layer's hook,
+    runs that layer's probe, and maps the score to a per-layer lambda.
+    Updates the corresponding LinearInterventionHook's weight.
+    """
+
+    def __init__(self, probe_dir, components, hooks_dict, base_lambda=-0.39,
+                 lambda_range=0.2, temp=2, bias=0.0):
+        """
+        Args:
+            probe_dir: directory with per-component subdirs containing clf_weights/bias
+            components: list of component names (sorted)
+            hooks_dict: {component_name: LinearInterventionHook} for weight updates
+            base_lambda: center lambda value
+            lambda_range: max deviation from base_lambda
+            temp: sigmoid temperature for score-to-lambda mapping
+            bias: probe score threshold center
+        """
+        self.components = sorted(components)
+        self.hooks_dict = hooks_dict
+        self.base_lambda = base_lambda
+        self.lambda_range = lambda_range
+        self.temp = temp
+        self.bias = bias
+
+        # Load per-layer probes
+        self.probes = {}  # component -> (weights_tensor, bias_scalar)
+        for comp in self.components:
+            comp_dir_name = comp.replace(".", "_").replace("[", "_").replace("]", "_")
+            comp_dir = os.path.join(probe_dir, comp_dir_name)
+            w = torch.from_numpy(torch.load(os.path.join(comp_dir, "clf_weights.pt"),
+                                            weights_only=False)).float()
+            b = torch.load(os.path.join(comp_dir, "clf_bias.pt"),
+                           weights_only=False).item()
+            self.probes[comp] = (w, b)
+
+        # Hidden state capture buffer
+        self.hidden_buffer = {}
+        self.capture_hooks = []
+
+    def register_capture_hooks(self, model):
+        """Register hooks to capture hidden states at each layer for probe scoring."""
+        for comp in self.components:
+            def make_hook(comp_name):
+                def hook(module, inp, output):
+                    hidden = output[0] if isinstance(output, tuple) else output
+                    if hidden.dim() == 3:
+                        last = hidden[:, -1, :].float()
+                    else:
+                        last = hidden[-1, :].float().unsqueeze(0)
+                    self.hidden_buffer[comp_name] = last.detach().cpu()
+                return hook
+            module = eval(f"model.{comp}")
+            handle = module.register_forward_hook(make_hook(comp))
+            self.capture_hooks.append(handle)
+
+    def score_and_update(self):
+        """Run per-layer probes on captured hidden states and update hook weights."""
+        for comp in self.components:
+            if comp not in self.hidden_buffer:
+                continue
+            hidden = self.hidden_buffer[comp].squeeze(0)  # [hidden_dim]
+            w, b = self.probes[comp]
+            score = (hidden @ w) + b  # scalar logit
+
+            # Map score to lambda via centered sigmoid
+            centered = (torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2
+            lam = self.base_lambda + self.lambda_range * centered.item()
+
+            if comp in self.hooks_dict:
+                self.hooks_dict[comp].weight = lam
+
+    def clear_buffer(self):
+        self.hidden_buffer.clear()
+
+    def remove_hooks(self):
+        for h in self.capture_hooks:
+            h.remove()
+        self.capture_hooks.clear()
 
 
 class TargetedInterventionHook():

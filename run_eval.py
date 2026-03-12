@@ -9,6 +9,7 @@ Modes (set via --intervention_type):
     additive                   fixed-lambda steering at every step boundary
     probe_last_token           uncertainty-gated: lambda scales with probe score
     question_adaptive          per-question lambda based on prompt probe score
+    per_layer_adaptive         per-layer lambda from per-layer probes at each step
 
 Usage:
     # Baseline
@@ -47,7 +48,7 @@ import numpy as np
 import torch
 
 from arg_utils import add_common_arguments
-from hook_utils import InterventionDirection, MODEL_NUM_LAYERS_MAP, ProbeMonitor
+from hook_utils import InterventionDirection, MODEL_NUM_LAYERS_MAP, ProbeMonitor, PerLayerProbeManager
 from utils import MODELS, analyze_math_results, extract_questions, get_save_dir
 
 DEFAULT_INSTRUCTION = "\nPlease reason step by step, and put your final answer within \\boxed{}."
@@ -75,6 +76,15 @@ def parse_args() -> argparse.Namespace:
                    help="Lambda for uncertain questions (question_adaptive mode).")
     p.add_argument("--adaptive_threshold", type=float, default=0.0,
                    help="Probe score threshold: >threshold=confident (question_adaptive mode).")
+    # Per-layer adaptive args
+    p.add_argument("--layer_probe_dir", type=str, default=None,
+                   help="Dir with per-layer probes (per_layer_adaptive mode).")
+    p.add_argument("--lambda_range", type=float, default=0.2,
+                   help="Max deviation from base lambda (per_layer_adaptive mode).")
+    p.add_argument("--probe_temp", type=float, default=2.0,
+                   help="Sigmoid temperature for score-to-lambda mapping.")
+    p.add_argument("--probe_bias", type=float, default=0.0,
+                   help="Probe score threshold center for sigmoid mapping.")
     return p.parse_args()
 
 
@@ -154,8 +164,11 @@ def run_eval(args: argparse.Namespace) -> None:
 
         def _apply_intervention(model):
             nonlocal weight_manager
-            # question_adaptive uses additive hooks; lambda is updated per-question
-            hook_type = "additive" if args.intervention_type == "question_adaptive" else args.intervention_type
+            # question_adaptive and per_layer_adaptive use additive hooks; lambda is updated dynamically
+            if args.intervention_type in ("question_adaptive", "per_layer_adaptive"):
+                hook_type = "additive"
+            else:
+                hook_type = args.intervention_type
             weight_manager = intv_dir.add_intervention(
                 model,
                 weight=args.with_intervention,
@@ -181,7 +194,7 @@ def run_eval(args: argparse.Namespace) -> None:
     tokenizer_vllm = llm.get_tokenizer()
 
     sampling_params = SamplingParams(
-        temperature=0.6 if args.n_samples > 1 else 0.0,
+        temperature=0.6,
         top_p=0.95,
         max_tokens=args.max_length,
     )
@@ -338,6 +351,77 @@ def run_eval(args: argparse.Namespace) -> None:
         print(f"\nAdaptive stats: {n_conf}/{len(lambda_choices)} confident "
               f"({100*n_conf/len(lambda_choices):.1f}%), "
               f"{len(lambda_choices)-n_conf} uncertain")
+    elif args.intervention_type == "per_layer_adaptive":
+        # Per-layer adaptive: each layer gets its own probe-driven lambda at each \n\n
+        if args.layer_probe_dir is None:
+            raise ValueError("--layer_probe_dir required for per_layer_adaptive mode.")
+
+        print("Setting up per-layer adaptive steering...")
+
+        # Collect the intervention hooks keyed by component name
+        layer_hooks_dict = {}
+        def collect_layer_hooks(model):
+            from hook_utils import ConditionalInterventionHook, LinearInterventionHook
+            for comp in active_components:
+                module = eval(f"model.{comp}")
+                for h in module._forward_hooks.values():
+                    if isinstance(h, ConditionalInterventionHook):
+                        if isinstance(h.base_hook, LinearInterventionHook):
+                            layer_hooks_dict[comp] = h.base_hook
+                    elif isinstance(h, LinearInterventionHook):
+                        layer_hooks_dict[comp] = h
+        llm.apply_model(collect_layer_hooks)
+        print(f"  Found {len(layer_hooks_dict)} intervention hooks")
+
+        # Create the per-layer probe manager
+        layer_manager = PerLayerProbeManager(
+            probe_dir=args.layer_probe_dir,
+            components=active_components,
+            hooks_dict=layer_hooks_dict,
+            base_lambda=args.with_intervention,
+            lambda_range=args.lambda_range,
+            temp=args.probe_temp,
+            bias=args.probe_bias,
+        )
+
+        # Register capture hooks and a trigger hook on embed_tokens
+        llm.apply_model(lambda model: layer_manager.register_capture_hooks(model))
+
+        # The ConditionalInterventionManager already detects \n\n tokens.
+        # We need the layer_manager to score and update BEFORE the intervention hooks fire.
+        # Register on embed_tokens with a hook that runs score_and_update when \n\n is detected.
+        tok = llm.get_tokenizer()
+        newline_token_ids_set = set(
+            tid for tid in range(tok.vocab_size)
+            if "\n\n" in tok.decode(tid)
+        )
+
+        def make_trigger_hook(manager, nn_ids):
+            def hook(module, input, output):
+                token_ids = input[0]
+                # Check if any token in the batch is a \n\n token
+                is_nn = torch.tensor([tid.item() in nn_ids for tid in token_ids.flatten()],
+                                     device=token_ids.device)
+                if is_nn.any():
+                    manager.score_and_update()
+                    manager.clear_buffer()
+            return hook
+
+        def register_trigger(model):
+            handle = model.model.embed_tokens.register_forward_hook(
+                make_trigger_hook(layer_manager, newline_token_ids_set)
+            )
+            layer_manager.capture_hooks.append(handle)  # for cleanup
+
+        llm.apply_model(register_trigger)
+        print(f"  Per-layer adaptive steering ready "
+              f"(base_lambda={args.with_intervention}, range={args.lambda_range})")
+
+        print("Running inference...")
+        outputs = llm.generate(prompts, sampling_params)
+
+        # Cleanup
+        layer_manager.remove_hooks()
     else:
         print("Running inference...")
         outputs = llm.generate(prompts, sampling_params)
