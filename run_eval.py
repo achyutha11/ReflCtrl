@@ -197,6 +197,7 @@ def run_eval(args: argparse.Namespace) -> None:
         temperature=0.6,
         top_p=0.95,
         max_tokens=args.max_length,
+        n=args.n_samples,
     )
 
     # ------------------------------------------------------------------
