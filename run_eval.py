@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
                    help="Sigmoid temperature for score-to-lambda mapping.")
     p.add_argument("--probe_bias", type=float, default=0.0,
                    help="Probe score threshold center for sigmoid mapping.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Random seed for sampling (default: vLLM default).")
     return p.parse_args()
 
 
@@ -193,12 +195,15 @@ def run_eval(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     tokenizer_vllm = llm.get_tokenizer()
 
-    sampling_params = SamplingParams(
+    sampling_kwargs = dict(
         temperature=0.6,
         top_p=0.95,
         max_tokens=args.max_length,
         n=args.n_samples,
     )
+    if args.seed is not None:
+        sampling_kwargs["seed"] = args.seed
+    sampling_params = SamplingParams(**sampling_kwargs)
 
     # ------------------------------------------------------------------
     # Question-adaptive: set up probe for per-question scoring
