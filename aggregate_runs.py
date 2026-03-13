@@ -64,7 +64,7 @@ def main():
     for run in all_runs:
         sample = run["sample_results"][0]
         all_correctness.append(sample["correctness"])
-        all_thinking_lengths.append(sample["thinking_lengths"])
+        all_thinking_lengths.append(sample["think_lengths"])
 
     # Majority vote: question is correct if majority of runs got it right
     majority_correct = 0
