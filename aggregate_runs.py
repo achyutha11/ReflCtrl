@@ -19,9 +19,6 @@ import json
 import os
 from collections import Counter
 
-from utils import extract_questions
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Aggregate multiple n=1 runs.")
     p.add_argument("--run_dirs", type=str, nargs="+", required=True,
