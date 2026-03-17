@@ -572,7 +572,6 @@ class PerLayerProbeManager():
             # Map score to lambda via centered sigmoid
             centered = (torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2
             lam = self.base_lambda + self.lambda_range * centered.item()
-            lam = min(lam, self.base_lambda)  # only steer harder, never softer
 
             if comp in self.hooks_dict:
                 self.hooks_dict[comp].weight = lam
