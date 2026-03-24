@@ -511,7 +511,8 @@ class PerLayerProbeManager():
     """
 
     def __init__(self, probe_dir, components, hooks_dict, base_lambda=-0.39,
-                 lambda_range=0.2, temp=2, bias=0.0, auroc_weighted=False):
+                 lambda_range=0.2, temp=2, bias=0.0, auroc_weighted=False,
+                 aggregate_scores=False):
         """
         Args:
             probe_dir: directory with per-component subdirs containing clf_weights/bias
@@ -523,6 +524,8 @@ class PerLayerProbeManager():
             bias: probe score threshold center
             auroc_weighted: if True, scale each layer's adjustment range by its
                            normalized AUROC (0 at AUROC=0.5, 1 at max AUROC)
+            aggregate_scores: if True, average all probe scores and apply a single
+                             uniform lambda to all layers (reduces per-layer noise)
         """
         self.components = sorted(components)
         self.hooks_dict = hooks_dict
@@ -531,6 +534,7 @@ class PerLayerProbeManager():
         self.temp = temp
         self.bias = bias
         self.auroc_weighted = auroc_weighted
+        self.aggregate_scores = aggregate_scores
 
         # Load per-layer probes
         self.probes = {}  # component -> (weights_tensor, bias_scalar)
@@ -580,22 +584,40 @@ class PerLayerProbeManager():
 
     def score_and_update(self):
         """Run per-layer probes on captured hidden states and update hook weights."""
-        for comp in self.components:
-            if comp not in self.hidden_buffer:
-                continue
-            hidden = self.hidden_buffer[comp].squeeze(0)  # [hidden_dim]
-            w, b = self.probes[comp]
-            score = (hidden @ w) + b  # scalar logit
+        if self.aggregate_scores:
+            # Compute all probe scores, average them, apply single lambda everywhere
+            scores = []
+            for comp in self.components:
+                if comp not in self.hidden_buffer:
+                    continue
+                hidden = self.hidden_buffer[comp].squeeze(0)
+                w, b = self.probes[comp]
+                score = (hidden @ w) + b
+                scores.append(score.item())
+            if scores:
+                avg_score = sum(scores) / len(scores)
+                centered = (torch.sigmoid(torch.tensor((avg_score - self.bias) / self.temp)) - 0.5) * 2
+                lam = self.base_lambda + self.lambda_range * centered.item()
+                for comp in self.components:
+                    if comp in self.hooks_dict:
+                        self.hooks_dict[comp].weight = lam
+        else:
+            for comp in self.components:
+                if comp not in self.hidden_buffer:
+                    continue
+                hidden = self.hidden_buffer[comp].squeeze(0)  # [hidden_dim]
+                w, b = self.probes[comp]
+                score = (hidden @ w) + b  # scalar logit
 
-            # Map score to lambda via centered sigmoid
-            centered = (torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2
-            effective_range = self.lambda_range
-            if self.auroc_weighted and comp in self.auroc_scale:
-                effective_range = self.lambda_range * self.auroc_scale[comp]
-            lam = self.base_lambda + effective_range * centered.item()
+                # Map score to lambda via centered sigmoid
+                centered = (torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2
+                effective_range = self.lambda_range
+                if self.auroc_weighted and comp in self.auroc_scale:
+                    effective_range = self.lambda_range * self.auroc_scale[comp]
+                lam = self.base_lambda + effective_range * centered.item()
 
-            if comp in self.hooks_dict:
-                self.hooks_dict[comp].weight = lam
+                if comp in self.hooks_dict:
+                    self.hooks_dict[comp].weight = lam
 
     def clear_buffer(self):
         self.hidden_buffer.clear()
