@@ -511,7 +511,7 @@ class PerLayerProbeManager():
     """
 
     def __init__(self, probe_dir, components, hooks_dict, base_lambda=-0.39,
-                 lambda_range=0.2, temp=2, bias=0.0):
+                 lambda_range=0.2, temp=2, bias=0.0, auroc_weighted=False):
         """
         Args:
             probe_dir: directory with per-component subdirs containing clf_weights/bias
@@ -521,6 +521,8 @@ class PerLayerProbeManager():
             lambda_range: max deviation from base_lambda
             temp: sigmoid temperature for score-to-lambda mapping
             bias: probe score threshold center
+            auroc_weighted: if True, scale each layer's adjustment range by its
+                           normalized AUROC (0 at AUROC=0.5, 1 at max AUROC)
         """
         self.components = sorted(components)
         self.hooks_dict = hooks_dict
@@ -528,6 +530,7 @@ class PerLayerProbeManager():
         self.lambda_range = lambda_range
         self.temp = temp
         self.bias = bias
+        self.auroc_weighted = auroc_weighted
 
         # Load per-layer probes
         self.probes = {}  # component -> (weights_tensor, bias_scalar)
@@ -539,6 +542,21 @@ class PerLayerProbeManager():
             b = torch.load(os.path.join(comp_dir, "clf_bias.pt"),
                            weights_only=False).item()
             self.probes[comp] = (w, b)
+
+        # Load per-layer AUROC weights if requested
+        self.auroc_scale = {}
+        if auroc_weighted:
+            import json
+            summary_path = os.path.join(probe_dir, "probe_summary.json")
+            with open(summary_path) as f:
+                summary = json.load(f)
+            # Normalize: AUROC 0.5 (random) -> weight 0, max AUROC -> weight 1
+            aurocs = {k: v['auroc'] for k, v in summary.items()}
+            max_auroc = max(aurocs.values())
+            for comp in self.components:
+                auroc = aurocs.get(comp, 0.5)
+                self.auroc_scale[comp] = max(0.0, (auroc - 0.5) / (max_auroc - 0.5))
+            print(f"  AUROC weighting enabled: scale range [{min(self.auroc_scale.values()):.3f}, {max(self.auroc_scale.values()):.3f}]")
 
         # Hidden state capture buffer
         self.hidden_buffer = {}
@@ -571,7 +589,10 @@ class PerLayerProbeManager():
 
             # Map score to lambda via centered sigmoid
             centered = (torch.sigmoid((score - self.bias) / self.temp) - 0.5) * 2
-            lam = self.base_lambda + self.lambda_range * centered.item()
+            effective_range = self.lambda_range
+            if self.auroc_weighted and comp in self.auroc_scale:
+                effective_range = self.lambda_range * self.auroc_scale[comp]
+            lam = self.base_lambda + effective_range * centered.item()
 
             if comp in self.hooks_dict:
                 self.hooks_dict[comp].weight = lam

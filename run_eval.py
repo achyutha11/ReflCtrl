@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
                    help="Sigmoid temperature for score-to-lambda mapping.")
     p.add_argument("--probe_bias", type=float, default=0.0,
                    help="Probe score threshold center for sigmoid mapping.")
+    p.add_argument("--auroc_weighted", action="store_true",
+                   help="Scale each layer's adjustment range by its probe AUROC.")
     p.add_argument("--seed", type=int, default=None,
                    help="Random seed for sampling (default: vLLM default).")
     return p.parse_args()
@@ -388,6 +390,7 @@ def run_eval(args: argparse.Namespace) -> None:
             lambda_range=args.lambda_range,
             temp=args.probe_temp,
             bias=args.probe_bias,
+            auroc_weighted=args.auroc_weighted,
         )
 
         # Register capture hooks and a trigger hook on embed_tokens
